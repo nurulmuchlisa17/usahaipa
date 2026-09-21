@@ -278,11 +278,24 @@ const BOSS_ROUNDS = [
   { A: { F: 60, s: 2 }, B: { F: 10, s: 20 }, C: { F: 35, s: 6 } }
 ];
 
-/* ---------- DASHBOARD KELOMPOK (localStorage, bertahan di browser ini) ---------- */
+/* ---------- DASHBOARD KELOMPOK (Google Sheets via Apps Script Web App) ---------- */
 
-const DASHBOARD_KEY = 'lordInersia_dashboard_v1';
+/*
+ * PENTING — SETUP GURU:
+ * Ganti URL di bawah ini dengan URL Web App Google Apps Script kamu sendiri
+ * (lihat README.md bagian "Setup Dashboard Google Sheets" untuk panduan lengkap).
+ * Selama masih berisi placeholder di bawah, dashboard otomatis berjalan
+ * dalam mode lokal (localStorage) sebagai cadangan agar game tetap bisa dites.
+ */
+const SHEET_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbzGNIoTf20O9AJFQvhAFgpucUFIi0TWGQyhwbQkvR-uycExSOCxpylnXo9v3ix0W0gPsA/exec';
 
-function loadDashboard() {
+const DASHBOARD_KEY = 'lordInersia_dashboard_cache_v1'; // cache lokal cadangan (offline/belum di-setup)
+
+function isSheetConfigured() {
+  return typeof SHEET_WEBAPP_URL === 'string' && SHEET_WEBAPP_URL.indexOf('https://script.google.com/') === 0;
+}
+
+function loadLocalCache() {
   try {
     const raw = localStorage.getItem(DASHBOARD_KEY);
     return raw ? JSON.parse(raw) : [];
@@ -291,20 +304,41 @@ function loadDashboard() {
   }
 }
 
-function saveCompletion(record) {
-  try {
-    const list = loadDashboard();
-    list.push(record);
-    localStorage.setItem(DASHBOARD_KEY, JSON.stringify(list));
-  } catch (e) {
-    /* localStorage tidak tersedia (mis. mode privat) — abaikan agar game tetap jalan */
-  }
+function saveLocalCache(list) {
+  try { localStorage.setItem(DASHBOARD_KEY, JSON.stringify(list)); } catch (e) { /* ignore */ }
 }
 
-function clearDashboard() {
+/* Mengirim hasil kemenangan kelompok ke Google Sheets (fire-and-forget, tidak memblokir alur game).
+   Content-Type text/plain sengaja dipakai agar termasuk "simple request" dan tidak kena preflight CORS. */
+function saveCompletion(record) {
+  // simpan cadangan lokal supaya dashboard tetap bisa ditampilkan walau offline / belum di-setup
+  const cache = loadLocalCache();
+  cache.push(record);
+  saveLocalCache(cache);
+
+  if (!isSheetConfigured()) return;
+
+  fetch(SHEET_WEBAPP_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(record)
+  }).catch(() => { /* jaringan bermasalah — data tetap aman di cache lokal */ });
+}
+
+/* Mengambil seluruh data dashboard dari Google Sheets.
+   Mengembalikan { ok, source, data } — source: 'sheet' | 'local' */
+async function fetchDashboard() {
+  if (!isSheetConfigured()) {
+    return { ok: false, source: 'local', data: loadLocalCache() };
+  }
   try {
-    localStorage.removeItem(DASHBOARD_KEY);
-  } catch (e) { /* ignore */ }
+    const res = await fetch(SHEET_WEBAPP_URL, { method: 'GET' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    return { ok: true, source: 'sheet', data: Array.isArray(data) ? data : [] };
+  } catch (e) {
+    return { ok: false, source: 'local', data: loadLocalCache() };
+  }
 }
 
 /* ---------- HELPERS ---------- */
@@ -1180,25 +1214,51 @@ function renderFinal() {
    7. DASHBOARD KELOMPOK
    ========================================================= */
 function renderDashboard() {
-  const list = loadDashboard().sort((a, b) => new Date(b.finishedAt) - new Date(a.finishedAt));
+  app.innerHTML = h`
+    <div class="panel">
+      <div class="tag green">📊 DASHBOARD</div>
+      <h2>Kelompok yang Telah Mengalahkan Lord Inersia</h2>
+      <p class="muted">Memuat data dashboard...</p>
+      <div class="btn-row">
+        <button class="btn-secondary" id="btnBack">← Kembali ke Beranda</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('btnBack').addEventListener('click', () => go('landing'));
+
+  fetchDashboard().then(({ ok, source, data }) => {
+    if (state.screen !== 'dashboard') return; // pengguna sudah pindah layar sebelum data selesai dimuat
+    renderDashboardResult(ok, source, data);
+  });
+}
+
+function renderDashboardResult(ok, source, data) {
+  const list = [...data].sort((a, b) => new Date(b.finishedAt) - new Date(a.finishedAt));
 
   const rows = list.map((rec, i) => {
-    const waktu = new Date(rec.finishedAt).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' });
+    const waktu = rec.finishedAt ? new Date(rec.finishedAt).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' }) : '-';
+    const anggota = Array.isArray(rec.members) ? rec.members : String(rec.members || '').split(',').map(s => s.trim()).filter(Boolean);
     return `<tr>
       <td>${i + 1}</td>
       <td style="text-align:left;">${escapeHtml(rec.groupName)}</td>
-      <td style="text-align:left;">${rec.members.map(escapeHtml).join(', ')}</td>
+      <td style="text-align:left;">${anggota.map(escapeHtml).join(', ')}</td>
       <td>${rec.score}</td>
       <td>${rec.energy}</td>
       <td>${waktu}</td>
     </tr>`;
   }).join('');
 
+  const statusBanner = source === 'sheet'
+    ? `<div class="feedback correct" style="margin-bottom:4px;">🌐 Data ini tersinkron dari Google Sheets — terlihat sama di semua perangkat.</div>`
+    : isSheetConfigured()
+      ? `<div class="feedback wrong" style="margin-bottom:4px;">⚠️ Gagal memuat dari Google Sheets (periksa koneksi internet). Menampilkan cadangan data lokal di perangkat ini saja.</div>`
+      : `<div class="feedback wrong" style="margin-bottom:4px;">⚙️ Dashboard belum terhubung ke Google Sheets, jadi data ini hanya tersimpan lokal di perangkat ini. Lihat README.md bagian "Setup Dashboard Google Sheets" untuk menghubungkannya agar terlihat di semua perangkat.</div>`;
+
   app.innerHTML = h`
     <div class="panel">
       <div class="tag green">📊 DASHBOARD</div>
       <h2>Kelompok yang Telah Mengalahkan Lord Inersia</h2>
-      <p class="muted">Daftar ini otomatis terisi setiap kali sebuah kelompok berhasil mencapai Victory dan menyelesaikan refleksi kelompok pada perangkat/browser ini.</p>
+      ${statusBanner}
 
       ${list.length === 0 ? `
         <div class="feedback" style="margin-top:14px;">Belum ada kelompok yang menyelesaikan misi ini. Ayo jadi yang pertama!</div>
@@ -1215,21 +1275,13 @@ function renderDashboard() {
 
       <div class="btn-row">
         <button class="btn-secondary" id="btnBack">← Kembali ke Beranda</button>
-        ${list.length > 0 ? `<button class="btn-danger" id="btnClear">🗑️ Hapus Semua Data Dashboard</button>` : ''}
+        <button class="btn-secondary" id="btnRefresh">🔄 Muat Ulang</button>
       </div>
     </div>
   `;
 
   document.getElementById('btnBack').addEventListener('click', () => go('landing'));
-  const clearBtn = document.getElementById('btnClear');
-  if (clearBtn) {
-    clearBtn.addEventListener('click', () => {
-      if (confirm('Yakin ingin menghapus seluruh data dashboard di perangkat ini? Tindakan ini tidak dapat dibatalkan.')) {
-        clearDashboard();
-        renderDashboard();
-      }
-    });
-  }
+  document.getElementById('btnRefresh').addEventListener('click', () => go('dashboard'));
 }
 
 function resetGame() {
